@@ -46,7 +46,7 @@ func TestRunCLI_Update(t *testing.T) {
 	if !updater.called {
 		t.Error("Updater was not called")
 	}
-	if !strings.Contains(out.String(), "Update complete") {
+	if !strings.Contains(out.String(), "XXXX Update complete") {
 		t.Errorf("Unexpected output: %s", out.String())
 	}
 }
