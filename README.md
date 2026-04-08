@@ -106,3 +106,4 @@ The module parses NBP's `archiwum_tab_a_<YEAR>.csv` files. It handles:
 
 ---
 *Built with ❤️ in Golang*
+ooooo
