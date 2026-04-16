@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"io/fs"
-	"nbpoffline/pkg/data"
-	"nbpoffline/pkg/nbpoffline"
+	"github.com/gites/nbpoffline/pkg/data"
+	"github.com/gites/nbpoffline/pkg/nbpoffline"
 )
 
 type RateProvider interface {
