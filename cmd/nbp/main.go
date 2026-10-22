@@ -1,36 +1,57 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"io/fs"
 	"github.com/gites/nbpoffline/pkg/data"
 	"github.com/gites/nbpoffline/pkg/nbpoffline"
 )
 
+const (
+	dateLayout        = "2006-01-02"
+	compactDateLayout = "20060102"
+
+	cmdQuery  = "query"
+	cmdUpdate = "update"
+
+	usageText = `Usage:
+  nbp [-a] [-p] <currency> [date]
+  nbp [-a] update
+
+  date     YYYY-MM-DD or YYYYMMDD (default: today)
+  -a       use table A (the only supported table)
+  -p       use the rate from the last business day before date (D-1)
+  -h       show this help
+
+The update command downloads current data into pkg/data/a and must be run
+from the repository root. Rebuild afterwards to embed the new data.
+`
+)
+
+// _dataDir is relative to the repository root.
+var _dataDir = filepath.Join("pkg", "data", "a")
+
+// RateProvider looks up exchange rates.
 type RateProvider interface {
-	GetRate(currency string, date time.Time) (float64, error)
+	GetRate(currency string, date time.Time) (float64, time.Time, error)
+	GetRateBefore(currency string, date time.Time) (float64, time.Time, error)
 	LoadData() error
 }
 
+// DataUpdater downloads exchange rate data for a range of years.
 type DataUpdater interface {
 	UpdateData(start, end int) error
 }
 
 func main() {
-	// Setup data directory
-	// ... (path logic)
-	wd, _ := os.Getwd()
-	dataDir := filepath.Join(wd, "pkg", "data", "a")
-
-	// Dependencies
-
 	subFS, err := fs.Sub(data.FS, "a")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating subFS: %v\n", err)
@@ -38,129 +59,150 @@ func main() {
 	}
 
 	repo := nbpoffline.NewRepository(subFS)
-	downloader := nbpoffline.NewDownloader(dataDir)
+	downloader := nbpoffline.NewDownloader(_dataDir)
 
-	if err := run(os.Args, os.Stdout, repo, downloader); err != nil {
+	if err := run(os.Args, os.Stdout, os.Stderr, repo, downloader, time.Now); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string, stdout io.Writer, repo RateProvider, updater DataUpdater) error {
-	cmd, cur, dateStr, err := parseArgs(args)
+func run(
+	args []string,
+	stdout, stderr io.Writer,
+	repo RateProvider,
+	updater DataUpdater,
+	now func() time.Time,
+) error {
+	opts, err := parseArgs(args)
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Fprint(stdout, usageText)
+		return nil
+	}
 	if err != nil {
-		printUsage()
+		fmt.Fprint(stderr, usageText)
 		return err
 	}
 
-	if cmd == "update" {
-		fmt.Fprintln(stdout, "Updating data... (Rebuild required to effect embedded data)")
-		// Download data from 2012 to current year
-		currentYear := time.Now().Year()
-		if err := updater.UpdateData(2012, currentYear); err != nil {
+	if opts.cmd == cmdUpdate {
+		return runUpdate(stdout, updater, now())
+	}
+	return runQuery(stdout, repo, opts, now())
+}
+
+func runUpdate(stdout io.Writer, updater DataUpdater, now time.Time) error {
+	fmt.Fprintln(stdout, "Updating data... (rebuild required for embedded data to take effect)")
+
+	year := now.Year()
+	if now.Month() == time.January {
+		if err := updater.UpdateData(year-1, year-1); err != nil {
 			return fmt.Errorf("update failed: %w", err)
 		}
-		fmt.Fprintln(stdout, "Update complete.")
-		return nil
 	}
 
-	if cmd == "query" {
-		// Load data
-		if err := repo.LoadData(); err != nil {
-			return fmt.Errorf("loading data: %w. Try running 'nbp update'", err)
-		}
-
-		// Parse date
-		targetDate := time.Now()
-		if dateStr != "" {
-			parsed, err := parseDate(dateStr)
-			if err != nil {
-				return fmt.Errorf("invalid date format: %w", err)
-			}
-			targetDate = parsed
-		}
-
-		rate, err := repo.GetRate(cur, targetDate)
-		if err != nil {
-			return fmt.Errorf("getting rate: %w", err)
-		}
-
-		fmt.Fprintf(stdout, "Rate for %s on %s: %.4f\n", strings.ToUpper(cur), targetDate.Format("2006-01-02"), rate)
-		return nil
+	err := updater.UpdateData(year, year)
+	if errors.Is(err, nbpoffline.ErrNotPublished) {
+		fmt.Fprintf(stdout, "Note: data for %d is not published yet, skipping.\n", year)
+	} else if err != nil {
+		return fmt.Errorf("update failed: %w", err)
 	}
 
+	fmt.Fprintln(stdout, "Update complete.")
 	return nil
 }
 
-func parseArgs(args []string) (cmd, cur, dateStr string, err error) {
-	// args[0] is program name
-	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
-	useTableA := fs.Bool("a", true, "use table A")
-
-	// flag package expects flags before args.
-	// But user requirement: nbp [-a] <valuta> <data>
-	// -a is optional.
-	// If inputs are mixed, flag might fail.
-	// Let's simple parse manually or use flag if it works.
-	// args[1:] passed to fs.Parse
-
-	// However, if args has "update", it might not have flags.
-	if len(args) < 2 {
-		return "", "", "", fmt.Errorf("not enough arguments")
+func runQuery(stdout io.Writer, repo RateProvider, opts cliArgs, now time.Time) error {
+	if err := repo.LoadData(); err != nil {
+		return fmt.Errorf("loading data: %w. Try running 'nbp update'", err)
 	}
 
-	// Simple manual check for update
-	if args[1] == "update" {
-		return "update", "", "", nil
+	target := now
+	if opts.date != "" {
+		parsed, err := parseDate(opts.date)
+		if err != nil {
+			return err
+		}
+		target = parsed
 	}
-	if len(args) > 2 && args[2] == "update" && args[1] == "-a" {
-		return "update", "", "", nil
+	// Compare by calendar day regardless of time zone.
+	target = time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, time.UTC)
+
+	getRate := repo.GetRate
+	if opts.prevDay {
+		getRate = repo.GetRateBefore
+	}
+	rate, found, err := getRate(opts.cur, target)
+	if err != nil {
+		return fmt.Errorf("getting rate: %w", err)
 	}
 
-	if err := fs.Parse(args[1:]); err != nil {
-		return "", "", "", err
+	label := strings.ToUpper(opts.cur)
+	switch {
+	case opts.prevDay:
+		fmt.Fprintf(stdout, "Rate for %s on %s (D-1 for %s): %.4f\n",
+			label, found.Format(dateLayout), target.Format(dateLayout), rate)
+	case found.Format(dateLayout) == target.Format(dateLayout):
+		fmt.Fprintf(stdout, "Rate for %s on %s: %.4f\n", label, found.Format(dateLayout), rate)
+	default:
+		fmt.Fprintf(stdout, "Rate for %s on %s (requested %s): %.4f\n",
+			label, found.Format(dateLayout), target.Format(dateLayout), rate)
 	}
-
-	// Check defaults
-	if !*useTableA {
-		// Requirements only support table A for now.
-		// Ignore or warn? Prompt says "Na razie nie ma potrzeby implementować ich obsługi".
-	}
-
-	remaining := fs.Args()
-	if len(remaining) == 0 {
-		return "", "", "", fmt.Errorf("missing currency")
-	}
-
-	if remaining[0] == "update" {
-		return "update", "", "", nil
-	}
-
-	cur = remaining[0]
-	if len(remaining) > 1 {
-		dateStr = remaining[1]
-	}
-
-	return "query", cur, dateStr, nil
+	return nil
 }
 
+// cliArgs holds parsed command-line arguments.
+type cliArgs struct {
+	cmd     string
+	cur     string
+	date    string
+	prevDay bool // -p: use the D-1 rate
+}
+
+// parseArgs parses os.Args-style arguments. Flags are accepted anywhere.
+// It returns flag.ErrHelp when help was requested.
+func parseArgs(args []string) (cliArgs, error) {
+	var (
+		opts       cliArgs
+		positional []string
+	)
+	for _, arg := range args[1:] {
+		switch {
+		case arg == "-a":
+			// Only table A is supported; the flag is accepted for compatibility.
+		case arg == "-p":
+			opts.prevDay = true
+		case arg == "-h" || arg == "-help" || arg == "--help":
+			return cliArgs{}, flag.ErrHelp
+		case strings.HasPrefix(arg, "-"):
+			return cliArgs{}, fmt.Errorf("unknown flag %q", arg)
+		default:
+			positional = append(positional, arg)
+		}
+	}
+
+	switch {
+	case len(positional) == 0:
+		return cliArgs{}, errors.New("not enough arguments")
+	case positional[0] == cmdUpdate && len(positional) == 1:
+		return cliArgs{cmd: cmdUpdate}, nil
+	case len(positional) > 2:
+		return cliArgs{}, fmt.Errorf("too many arguments: %q", positional)
+	}
+
+	opts.cmd = cmdQuery
+	opts.cur = positional[0]
+	if len(positional) > 1 {
+		opts.date = positional[1]
+	}
+	return opts, nil
+}
+
+// parseDate accepts YYYY-MM-DD or YYYYMMDD.
 func parseDate(s string) (time.Time, error) {
-	// formats: YYYYMMDD or YYYY-MM-DD
-	// Try YYYY-MM-DD
-	t, err := time.Parse("2006-01-02", s)
-	if err == nil {
-		return t, nil
+	for _, layout := range []string{dateLayout, compactDateLayout} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
 	}
-	// Try YYYYMMDD
-	t, err = time.Parse("20060102", s)
-	if err == nil {
-		return t, nil
-	}
-	return time.Time{}, fmt.Errorf("unknown format")
-}
-
-func printUsage() {
-	fmt.Println("Usage:")
-	fmt.Println("  nbp [-a] <currency> [date]")
-	fmt.Println("  nbp [-a] update")
+	return time.Time{}, fmt.Errorf("invalid date %q: want YYYY-MM-DD or YYYYMMDD", s)
 }

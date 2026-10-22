@@ -7,7 +7,7 @@
 *.dll
 *.so
 *.dylib
-./nbp
+/nbp
 
 # Test binary, built with `go test -c`
 *.test
@@ -31,3 +31,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# macOS
+.DS_Store
+
+# Stray local data file
+/pkg/data/a/a.csv

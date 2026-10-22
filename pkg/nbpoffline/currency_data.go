@@ -2,6 +2,7 @@ package nbpoffline
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io/fs"
 	"strconv"
@@ -9,14 +10,31 @@ import (
 	"time"
 )
 
+const (
+	_dateLayout     = "20060102"
+	_fallbackDays   = 10
+	_filenamePrefix = "archiwum_tab_a_"
+	_filenameSuffix = ".csv"
+	_currencyLen    = 3
+)
+
+var (
+	// ErrNoData is returned when no rates have been loaded.
+	ErrNoData = errors.New("no data loaded")
+	// ErrCurrencyNotFound is returned when the currency is unknown.
+	ErrCurrencyNotFound = errors.New("currency not found")
+	// ErrRateNotFound is returned when no rate exists within the fallback window.
+	ErrRateNotFound = errors.New("rate not found")
+)
+
+// Repository holds NBP table A exchange rates loaded from CSV archives.
 type Repository struct {
 	dataFS fs.FS
-	// Internal storage for rates.
-	// Map: Currency Code -> Date (YYYYMMDD) -> Value
-	// We use YYYYMMDD string for simple key.
+	// rates maps currency code -> date (YYYYMMDD) -> rate for one unit.
 	rates map[string]map[string]float64
 }
 
+// NewRepository returns a Repository reading archives from dataFS.
 func NewRepository(dataFS fs.FS) *Repository {
 	return &Repository{
 		dataFS: dataFS,
@@ -25,16 +43,11 @@ func NewRepository(dataFS fs.FS) *Repository {
 }
 
 func extractYearFromFilename(filename string) (int, error) {
-	// Format: archiwum_tab_a_2024.csv
-	// Expected length: len("archiwum_tab_a_") + 4 + len(".csv") = 15 + 4 + 4 = 23
-	prefix := "archiwum_tab_a_"
-	suffix := ".csv"
-
-	if !strings.HasPrefix(filename, prefix) || !strings.HasSuffix(filename, suffix) {
+	if !strings.HasPrefix(filename, _filenamePrefix) || !strings.HasSuffix(filename, _filenameSuffix) {
 		return 0, fmt.Errorf("invalid filename format")
 	}
 
-	yearStr := strings.TrimSuffix(strings.TrimPrefix(filename, prefix), suffix)
+	yearStr := strings.TrimSuffix(strings.TrimPrefix(filename, _filenamePrefix), _filenameSuffix)
 	year, err := strconv.Atoi(yearStr)
 	if err != nil {
 		return 0, fmt.Errorf("invalid year: %w", err)
@@ -43,6 +56,7 @@ func extractYearFromFilename(filename string) (int, error) {
 	return year, nil
 }
 
+// LoadData reads all table A archives found in the repository's file system.
 func (r *Repository) LoadData() error {
 	entries, err := fs.ReadDir(r.dataFS, ".")
 	if err != nil {
@@ -53,13 +67,43 @@ func (r *Repository) LoadData() error {
 		if entry.IsDir() {
 			continue
 		}
-		if _, err := extractYearFromFilename(entry.Name()); err == nil {
-			if err := r.loadFile(entry.Name()); err != nil {
-				return fmt.Errorf("loading file %s: %w", entry.Name(), err)
-			}
+		if _, err := extractYearFromFilename(entry.Name()); err != nil {
+			continue
+		}
+		if err := r.loadFile(entry.Name()); err != nil {
+			return fmt.Errorf("loading file %s: %w", entry.Name(), err)
 		}
 	}
 	return nil
+}
+
+type colInfo struct {
+	currency string
+	scale    float64
+}
+
+// parseHeader parses a column header such as "1THB", "100JPY" or
+// "1USDdolar amerykański" into its currency code and scale.
+func parseHeader(h string) (colInfo, bool) {
+	h = strings.TrimSpace(h)
+	i := 0
+	for i < len(h) && h[i] >= '0' && h[i] <= '9' {
+		i++
+	}
+	if i == 0 || len(h) < i+_currencyLen {
+		return colInfo{}, false
+	}
+	code := h[i : i+_currencyLen]
+	for j := 0; j < len(code); j++ {
+		if code[j] < 'A' || code[j] > 'Z' {
+			return colInfo{}, false
+		}
+	}
+	scale, err := strconv.ParseFloat(h[:i], 64)
+	if err != nil || scale == 0 {
+		return colInfo{}, false
+	}
+	return colInfo{currency: code, scale: scale}, true
 }
 
 func (r *Repository) loadFile(path string) error {
@@ -71,131 +115,84 @@ func (r *Repository) loadFile(path string) error {
 
 	scanner := bufio.NewScanner(f)
 
-	// Read header
 	if !scanner.Scan() {
 		return fmt.Errorf("empty file")
 	}
-	headerLine := scanner.Text()
-	headers := strings.Split(headerLine, ";")
+	headers := strings.Split(scanner.Text(), ";")
 	if len(headers) < 2 {
 		return fmt.Errorf("invalid header")
 	}
 
-	// Parse headers to map column index to (Currency, Scale)
-	type colInfo struct {
-		currency string
-		scale    float64
-	}
 	cols := make(map[int]colInfo)
-
-	for i, h := range headers {
-		if i == 0 {
-			continue // Date column
-		}
-		h = strings.TrimSpace(h)
-		if h == "" {
-			continue
-		}
-
-		// Parse scale and currency, e.g. "1THB", "100JPY"
-		// Find first non-digit
-		firstLetterIdx := -1
-		for j, char := range h {
-			if char < '0' || char > '9' {
-				firstLetterIdx = j
-				break
-			}
-		}
-
-		if firstLetterIdx <= 0 {
-			// No digit at start or no letters? content like "nr tabeli"
-			continue
-		}
-
-		scaleStr := h[:firstLetterIdx]
-		currency := h[firstLetterIdx:]
-		scale, err := strconv.ParseFloat(scaleStr, 64)
-		if err != nil {
-			continue
-		}
-
-		cols[i] = colInfo{
-			currency: currency,
-			scale:    scale,
+	for i, h := range headers[1:] {
+		if info, ok := parseHeader(h); ok {
+			cols[i+1] = info
 		}
 	}
 
-	// Read data
 	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.Split(line, ";")
-		if len(parts) < 2 {
+		parts := strings.Split(scanner.Text(), ";")
+		dateStr := strings.TrimSpace(parts[0])
+		if len(dateStr) != len(_dateLayout) {
+			continue
+		}
+		if _, err := time.Parse(_dateLayout, dateStr); err != nil {
 			continue
 		}
 
-		dateStr := strings.TrimSpace(parts[0])
-		// data format YYYYMMDD
-
-		for i, part := range parts {
-			if i == 0 {
-				continue
-			}
-			info, ok := cols[i]
+		for i, part := range parts[1:] {
+			info, ok := cols[i+1]
 			if !ok {
 				continue
 			}
-
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
 			}
-
-			// Replace , with .
-			valStr := strings.Replace(part, ",", ".", 1)
-			val, err := strconv.ParseFloat(valStr, 64)
+			val, err := strconv.ParseFloat(strings.Replace(part, ",", ".", 1), 64)
 			if err != nil {
 				continue
 			}
 
-			// Normalize value
-			rate := val / info.scale
-
-			// Store
-			if _, ok := r.rates[info.currency]; !ok {
+			if r.rates[info.currency] == nil {
 				r.rates[info.currency] = make(map[string]float64)
 			}
-			r.rates[info.currency][dateStr] = rate
+			r.rates[info.currency][dateStr] = val / info.scale
 		}
 	}
 
 	return scanner.Err()
 }
 
-func (r *Repository) GetRate(currency string, date time.Time) (float64, error) {
+// GetRate returns the PLN rate of one unit of currency on date, along with the
+// date of the rate actually found. If date has no rate, the closest earlier
+// day within the fallback window is used. The returned date is at midnight UTC.
+func (r *Repository) GetRate(currency string, date time.Time) (float64, time.Time, error) {
 	currency = strings.ToUpper(currency)
 	if len(r.rates) == 0 {
-		return 0, fmt.Errorf("no data loaded")
+		return 0, time.Time{}, ErrNoData
 	}
 
 	rateMap, ok := r.rates[currency]
 	if !ok {
-		return 0, fmt.Errorf("currency not found: %s", currency)
+		return 0, time.Time{}, fmt.Errorf("%w: %s", ErrCurrencyNotFound, currency)
 	}
 
-	// Try exact match
-	key := date.Format("20060102")
-	if rate, ok := rateMap[key]; ok {
-		return rate, nil
-	}
-
-	// Try previous days (limit 10 days)
-	for i := 1; i <= 10; i++ {
-		prevDate := date.AddDate(0, 0, -i)
-		key := prevDate.Format("20060102")
-		if rate, ok := rateMap[key]; ok {
-			return rate, nil
+	y, m, d := date.Date()
+	day := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	for i := 0; i <= _fallbackDays; i++ {
+		found := day.AddDate(0, 0, -i)
+		if rate, ok := rateMap[found.Format(_dateLayout)]; ok {
+			return rate, found, nil
 		}
 	}
 
-	return 0, fmt.Errorf("rate not found for %s near %s", currency, key)
+	return 0, time.Time{}, fmt.Errorf("%w: %s near %s", ErrRateNotFound, currency, day.Format(_dateLayout))
+}
+
+// GetRateBefore returns the rate from the last day with a published rate
+// strictly before date (the "D-1" rule used e.g. for Polish income tax),
+// along with the date of that rate.
+func (r *Repository) GetRateBefore(currency string, date time.Time) (float64, time.Time, error) {
+	return r.GetRate(currency, date.AddDate(0, 0, -1))
 }
