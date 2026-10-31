@@ -12,6 +12,7 @@ This project was built to solve the need for reliable, offline-first currency co
 **Key Features:**
 - 📅 **Offline Access**: Query rates from local CSV files.
 - 🔄 **Smart Fallback**: Automatically finds the last known rate if data for a specific date is missing (e.g., weekends/holidays).
+- 🛡️ **Stale Data Detection**: Dates after the last loaded rate return `ErrDateAfterData` instead of a silently outdated rate.
 - 📦 **Easy Updates**: `nbp update` command fetches the latest data from NBP servers.
 - 🛠️ **Dual Mode**: Use as a CLI tool or import as a Go library.
 
@@ -60,6 +61,19 @@ Rate for USD on 2024-01-05 (D-1 for 2024-01-08): 3.9850
 In the library use `repo.GetRateBefore(currency, date)`.
 
 If the date is omitted, it defaults to today. Run `nbp -h` for all options.
+
+If the date is after the newest embedded rate, the command fails and suggests running `nbp update` and rebuilding, rather than printing an outdated rate.
+
+### Last Data Date
+Show the date of the newest embedded rate:
+
+```bash
+nbp last
+```
+
+```
+Last data date: 2024-01-05
+```
 
 ### Update Data
 Download the current year's data (and the previous year during January) into `pkg/data/a`. Run it from the repository root. A current-year file that NBP has not published yet is tolerated.
@@ -110,6 +124,20 @@ func main() {
 	}
 
 	fmt.Printf("EUR Rate: %.4f (as of %s)\n", rate, rateDate.Format("2006-01-02"))
+}
+```
+
+### Data Freshness
+
+`repo.LastDate()` returns the latest date (midnight UTC) for which any rate was loaded, or `nbpoffline.ErrNoData` if nothing was loaded.
+
+`GetRate` (and therefore `GetRateBefore`) returns `nbpoffline.ErrDateAfterData` for any date after `LastDate()`, because the data cannot prove that no newer rate exists. This includes a weekend directly following the last loaded Friday. The weekend/holiday fallback still applies to dates up to and including `LastDate()`.
+
+```go
+rate, rateDate, err := repo.GetRate("EUR", date)
+if errors.Is(err, nbpoffline.ErrDateAfterData) {
+	last, _ := repo.LastDate()
+	log.Printf("data ends on %s; run 'nbp update' and rebuild", last.Format("2006-01-02"))
 }
 ```
 

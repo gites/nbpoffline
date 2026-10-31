@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,8 @@ type mockRepo struct {
 	found      time.Time
 	err        error
 	loadErr    error
+	last       time.Time
+	lastErr    error
 	gotCur     string
 	gotDate    time.Time
 	getCalls   int
@@ -23,6 +26,8 @@ type mockRepo struct {
 }
 
 func (m *mockRepo) LoadData() error { return m.loadErr }
+
+func (m *mockRepo) LastDate() (time.Time, error) { return m.last, m.lastErr }
 
 func (m *mockRepo) GetRate(currency string, date time.Time) (float64, time.Time, error) {
 	m.getCalls++
@@ -66,6 +71,7 @@ func TestParseArgs(t *testing.T) {
 		{name: "currency", give: []string{"nbp", "USD"}, wantCmd: "query", wantCur: "USD"},
 		{name: "currency and date", give: []string{"nbp", "USD", "2024-01-01"}, wantCmd: "query", wantCur: "USD", wantDate: "2024-01-01"},
 		{name: "update", give: []string{"nbp", "update"}, wantCmd: "update"},
+		{name: "last", give: []string{"nbp", "last"}, wantCmd: "last"},
 		{name: "flag before currency", give: []string{"nbp", "-a", "EUR"}, wantCmd: "query", wantCur: "EUR"},
 		{name: "flag before update", give: []string{"nbp", "-a", "update"}, wantCmd: "update"},
 		{name: "flag after update", give: []string{"nbp", "update", "-a"}, wantCmd: "update"},
@@ -192,6 +198,14 @@ func TestRunQuery(t *testing.T) {
 			wantErr:  true,
 			wantCur:  "XYZ",
 			wantDate: day(2024, 3, 10),
+		},
+		{
+			name:     "date after data",
+			giveArgs: []string{"nbp", "USD", "2024-03-12"},
+			giveRepo: &mockRepo{err: fmt.Errorf("%w: requested 20240312", nbpoffline.ErrDateAfterData)},
+			wantErr:  true,
+			wantCur:  "USD",
+			wantDate: day(2024, 3, 12),
 		},
 		{
 			name:        "load error",
@@ -327,5 +341,42 @@ func TestRunHelpAndUsage(t *testing.T) {
 				t.Errorf("usage on stderr = %v, want %v", got, tt.wantStderr)
 			}
 		})
+	}
+}
+
+func TestRunLast(t *testing.T) {
+	tests := []struct {
+		name     string
+		giveRepo *mockRepo
+		wantOut  string
+		wantErr  bool
+	}{
+		{name: "ok", giveRepo: &mockRepo{last: day(2024, 3, 8)}, wantOut: "Last data date: 2024-03-08\n"},
+		{name: "no data", giveRepo: &mockRepo{lastErr: nbpoffline.ErrNoData}, wantErr: true},
+		{name: "load error", giveRepo: &mockRepo{loadErr: errors.New("boom")}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			err := run([]string{"nbp", "last"}, &stdout, &stderr, tt.giveRepo, &mockDownloader{}, time.Now)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if stdout.String() != tt.wantOut {
+				t.Errorf("stdout = %q, want %q", stdout.String(), tt.wantOut)
+			}
+		})
+	}
+}
+
+func TestRunQueryDateAfterDataHint(t *testing.T) {
+	repo := &mockRepo{err: nbpoffline.ErrDateAfterData}
+	err := run([]string{"nbp", "USD", "2024-03-12"}, &bytes.Buffer{}, &bytes.Buffer{}, repo, &mockDownloader{}, time.Now)
+	if !errors.Is(err, nbpoffline.ErrDateAfterData) {
+		t.Fatalf("err = %v, want ErrDateAfterData", err)
+	}
+	if !strings.Contains(err.Error(), "nbp update") {
+		t.Errorf("err = %q, want hint about 'nbp update'", err)
 	}
 }
