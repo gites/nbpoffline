@@ -199,7 +199,7 @@ func (r *Repository) GetRate(currency string, date time.Time) (float64, time.Tim
 	day := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 	if day.After(r.lastDate) {
 		return 0, time.Time{}, fmt.Errorf("%w: requested %s, last date %s",
-			ErrDateAfterData, day.Format(_dateLayout), r.lastDate.Format(_dateLayout))
+			ErrDateAfterData, day.Format(time.DateOnly), r.lastDate.Format(time.DateOnly))
 	}
 
 	rateMap, ok := r.rates[currency]
