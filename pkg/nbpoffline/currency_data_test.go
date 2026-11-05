@@ -54,7 +54,8 @@ func TestExtractYearFromFilename(t *testing.T) {
 func TestGetRate(t *testing.T) {
 	const data = "data;1THB;1USD;100JPY\n" +
 		"20240102;0,1154;3,9455;2,7563\n" +
-		"20240105;0,1147;3,9700;2,7000\n"
+		"20240105;0,1147;3,9700;2,7000\n" +
+		"20240115;0,1100;;\n"
 
 	tests := []struct {
 		name         string
@@ -89,9 +90,10 @@ func TestGetRate(t *testing.T) {
 }
 
 func TestGetRateBefore(t *testing.T) {
-	const data = "data;1USD\n" +
-		"20240102;3,9455\n" +
-		"20240105;3,9700\n"
+	const data = "data;1THB;1USD\n" +
+		"20240102;0,1154;3,9455\n" +
+		"20240105;0,1147;3,9700\n" +
+		"20240108;0,1100;\n"
 
 	tests := []struct {
 		name     string
@@ -121,8 +123,129 @@ func TestGetRateBefore(t *testing.T) {
 	}
 }
 
+func TestLastDate(t *testing.T) {
+	tests := []struct {
+		name    string
+		giveFS  fstest.MapFS
+		want    time.Time
+		wantErr error
+	}{
+		{name: "empty repo", giveFS: fstest.MapFS{}, wantErr: ErrNoData},
+		{
+			name: "header only",
+			giveFS: fstest.MapFS{
+				"archiwum_tab_a_2024.csv": &fstest.MapFile{Data: []byte("data;1USD\n")},
+			},
+			wantErr: ErrNoData,
+		},
+		{
+			name: "single file",
+			giveFS: fstest.MapFS{
+				"archiwum_tab_a_2024.csv": &fstest.MapFile{Data: []byte(
+					"data;1USD\n20240102;3,9455\n20240105;3,9700\n")},
+			},
+			want: date(2024, 1, 5),
+		},
+		{
+			name: "multi year",
+			giveFS: fstest.MapFS{
+				"archiwum_tab_a_2024.csv": &fstest.MapFile{Data: []byte(
+					"data;1USD\n20241230;4,1000\n")},
+				"archiwum_tab_a_2025.csv": &fstest.MapFile{Data: []byte(
+					"data;1USD\n20250102;4,2000\n20250103;4,2100\n")},
+			},
+			want: date(2025, 1, 3),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := NewRepository(tt.giveFS)
+			if err := repo.LoadData(); err != nil {
+				t.Fatalf("LoadData() error = %v", err)
+			}
+			got, err := repo.LastDate()
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if !got.Equal(tt.want) {
+				t.Errorf("LastDate() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetRateAfterLastDate(t *testing.T) {
+	// 2024-01-05 is a Friday; 2024-01-03 is a Wednesday without a rate.
+	const data = "data;1USD\n" +
+		"20240102;3,9455\n" +
+		"20240105;3,9700\n"
+
+	tests := []struct {
+		name     string
+		giveDate time.Time
+		wantRate float64
+		wantDate time.Time
+		wantErr  error
+	}{
+		{name: "exactly last date", giveDate: date(2024, 1, 5), wantRate: 3.97, wantDate: date(2024, 1, 5)},
+		{name: "weekend fallback inside range", giveDate: date(2024, 1, 3), wantRate: 3.9455, wantDate: date(2024, 1, 2)},
+		{name: "day after last date", giveDate: date(2024, 1, 6), wantErr: ErrDateAfterData},
+		{name: "week after last date", giveDate: date(2024, 1, 12), wantErr: ErrDateAfterData},
+	}
+
+	repo := newTestRepo(t, data)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rate, got, err := repo.GetRate("USD", tt.giveDate)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if math.Abs(rate-tt.wantRate) > 1e-9 {
+				t.Errorf("rate = %v, want %v", rate, tt.wantRate)
+			}
+			if !got.Equal(tt.wantDate) {
+				t.Errorf("date = %v, want %v", got, tt.wantDate)
+			}
+		})
+	}
+}
+
+func TestGetRateBeforeAfterLastDate(t *testing.T) {
+	const data = "data;1USD\n" +
+		"20240102;3,9455\n" +
+		"20240105;3,9700\n"
+
+	tests := []struct {
+		name     string
+		giveDate time.Time
+		wantRate float64
+		wantDate time.Time
+		wantErr  error
+	}{
+		{name: "day after last date", giveDate: date(2024, 1, 6), wantRate: 3.97, wantDate: date(2024, 1, 5)},
+		{name: "two days after last date", giveDate: date(2024, 1, 7), wantErr: ErrDateAfterData},
+	}
+
+	repo := newTestRepo(t, data)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rate, got, err := repo.GetRateBefore("USD", tt.giveDate)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if math.Abs(rate-tt.wantRate) > 1e-9 {
+				t.Errorf("rate = %v, want %v", rate, tt.wantRate)
+			}
+			if !got.Equal(tt.wantDate) {
+				t.Errorf("date = %v, want %v", got, tt.wantDate)
+			}
+		})
+	}
+}
+
 func TestGetRateErrors(t *testing.T) {
-	loaded := newTestRepo(t, "data;1USD\n20240102;3,9455\n")
+	loaded := newTestRepo(t, "data;1THB;1USD\n20240102;0,1154;3,9455\n20240120;0,1100;\n")
 
 	tests := []struct {
 		name         string
@@ -135,6 +258,7 @@ func TestGetRateErrors(t *testing.T) {
 		{"unknown currency", loaded, "XXX", date(2024, 1, 2), ErrCurrencyNotFound},
 		{"before data", loaded, "USD", date(2024, 1, 1), ErrRateNotFound},
 		{"beyond window", loaded, "USD", date(2024, 1, 13), ErrRateNotFound},
+		{"after data", loaded, "USD", date(2024, 1, 21), ErrDateAfterData},
 	}
 
 	for _, tt := range tests {

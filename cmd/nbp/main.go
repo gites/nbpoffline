@@ -21,10 +21,12 @@ const (
 
 	cmdQuery  = "query"
 	cmdUpdate = "update"
+	cmdLast   = "last"
 
 	usageText = `Usage:
   nbp [-a] [-p] <currency> [date]
   nbp [-a] update
+  nbp last
 
   date     YYYY-MM-DD or YYYYMMDD (default: today)
   -a       use table A (the only supported table)
@@ -33,6 +35,7 @@ const (
 
 The update command downloads current data into pkg/data/a and must be run
 from the repository root. Rebuild afterwards to embed the new data.
+The last command prints the date of the newest embedded rate.
 `
 )
 
@@ -43,6 +46,7 @@ var _dataDir = filepath.Join("pkg", "data", "a")
 type RateProvider interface {
 	GetRate(currency string, date time.Time) (float64, time.Time, error)
 	GetRateBefore(currency string, date time.Time) (float64, time.Time, error)
+	LastDate() (time.Time, error)
 	LoadData() error
 }
 
@@ -87,7 +91,22 @@ func run(
 	if opts.cmd == cmdUpdate {
 		return runUpdate(stdout, updater, now())
 	}
+	if opts.cmd == cmdLast {
+		return runLast(stdout, repo)
+	}
 	return runQuery(stdout, repo, opts, now())
+}
+
+func runLast(stdout io.Writer, repo RateProvider) error {
+	if err := repo.LoadData(); err != nil {
+		return fmt.Errorf("loading data: %w. Try running 'nbp update'", err)
+	}
+	last, err := repo.LastDate()
+	if err != nil {
+		return fmt.Errorf("getting last date: %w", err)
+	}
+	fmt.Fprintf(stdout, "Last data date: %s\n", last.Format(dateLayout))
+	return nil
 }
 
 func runUpdate(stdout io.Writer, updater DataUpdater, now time.Time) error {
@@ -132,6 +151,9 @@ func runQuery(stdout io.Writer, repo RateProvider, opts cliArgs, now time.Time) 
 		getRate = repo.GetRateBefore
 	}
 	rate, found, err := getRate(opts.cur, target)
+	if errors.Is(err, nbpoffline.ErrDateAfterData) {
+		return fmt.Errorf("%w. Run 'nbp update' and rebuild to load newer data", err)
+	}
 	if err != nil {
 		return fmt.Errorf("getting rate: %w", err)
 	}
@@ -185,6 +207,8 @@ func parseArgs(args []string) (cliArgs, error) {
 		return cliArgs{}, errors.New("not enough arguments")
 	case positional[0] == cmdUpdate && len(positional) == 1:
 		return cliArgs{cmd: cmdUpdate}, nil
+	case positional[0] == cmdLast && len(positional) == 1:
+		return cliArgs{cmd: cmdLast}, nil
 	case len(positional) > 2:
 		return cliArgs{}, fmt.Errorf("too many arguments: %q", positional)
 	}

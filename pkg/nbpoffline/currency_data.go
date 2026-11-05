@@ -25,6 +25,9 @@ var (
 	ErrCurrencyNotFound = errors.New("currency not found")
 	// ErrRateNotFound is returned when no rate exists within the fallback window.
 	ErrRateNotFound = errors.New("rate not found")
+	// ErrDateAfterData is returned when the requested date is after the last
+	// date for which rates were loaded.
+	ErrDateAfterData = errors.New("date after loaded data")
 )
 
 // Repository holds NBP table A exchange rates loaded from CSV archives.
@@ -32,6 +35,8 @@ type Repository struct {
 	dataFS fs.FS
 	// rates maps currency code -> date (YYYYMMDD) -> rate for one unit.
 	rates map[string]map[string]float64
+	// lastDate is the latest date with any loaded rate; zero if none.
+	lastDate time.Time
 }
 
 // NewRepository returns a Repository reading archives from dataFS.
@@ -136,7 +141,8 @@ func (r *Repository) loadFile(path string) error {
 		if len(dateStr) != len(_dateLayout) {
 			continue
 		}
-		if _, err := time.Parse(_dateLayout, dateStr); err != nil {
+		parsed, err := time.Parse(_dateLayout, dateStr)
+		if err != nil {
 			continue
 		}
 
@@ -158,19 +164,42 @@ func (r *Repository) loadFile(path string) error {
 				r.rates[info.currency] = make(map[string]float64)
 			}
 			r.rates[info.currency][dateStr] = val / info.scale
+			if parsed.After(r.lastDate) {
+				r.lastDate = parsed
+			}
 		}
 	}
 
 	return scanner.Err()
 }
 
+// LastDate returns the latest date (midnight UTC) for which any rate was
+// loaded, or ErrNoData if nothing was loaded.
+func (r *Repository) LastDate() (time.Time, error) {
+	if r.lastDate.IsZero() {
+		return time.Time{}, ErrNoData
+	}
+	return r.lastDate, nil
+}
+
 // GetRate returns the PLN rate of one unit of currency on date, along with the
 // date of the rate actually found. If date has no rate, the closest earlier
 // day within the fallback window is used. The returned date is at midnight UTC.
+//
+// Any date after LastDate yields ErrDateAfterData, because the loaded data
+// cannot prove that no newer rate exists. This includes days right after the
+// last loaded day, such as a weekend following the last loaded Friday.
 func (r *Repository) GetRate(currency string, date time.Time) (float64, time.Time, error) {
 	currency = strings.ToUpper(currency)
 	if len(r.rates) == 0 {
 		return 0, time.Time{}, ErrNoData
+	}
+
+	y, m, d := date.Date()
+	day := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	if day.After(r.lastDate) {
+		return 0, time.Time{}, fmt.Errorf("%w: requested %s, last date %s",
+			ErrDateAfterData, day.Format(time.DateOnly), r.lastDate.Format(time.DateOnly))
 	}
 
 	rateMap, ok := r.rates[currency]
@@ -178,8 +207,6 @@ func (r *Repository) GetRate(currency string, date time.Time) (float64, time.Tim
 		return 0, time.Time{}, fmt.Errorf("%w: %s", ErrCurrencyNotFound, currency)
 	}
 
-	y, m, d := date.Date()
-	day := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 	for i := 0; i <= _fallbackDays; i++ {
 		found := day.AddDate(0, 0, -i)
 		if rate, ok := rateMap[found.Format(_dateLayout)]; ok {
