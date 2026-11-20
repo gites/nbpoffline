@@ -36,6 +36,8 @@ Get the exchange rate for a currency on a specific date.
 nbp USD 2024-01-05
 ```
 
+The date can be `YYYY-MM-DD`, `YYYYMMDD` or day-first (`DD-MM-YYYY`, `DD.MM.YYYY`, `DD/MM/YYYY`, `DDMMYYYY`); the format is detected automatically, and the date may also come before the currency (`nbp 05-01-2024 usd`).
+
 **Output:**
 ```
 Rate for USD on 2024-01-05: 3.9850

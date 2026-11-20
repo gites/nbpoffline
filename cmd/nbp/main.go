@@ -16,8 +16,7 @@ import (
 )
 
 const (
-	dateLayout        = "2006-01-02"
-	compactDateLayout = "20060102"
+	dateLayout = "2006-01-02"
 
 	cmdQuery  = "query"
 	cmdUpdate = "update"
@@ -25,10 +24,14 @@ const (
 
 	usageText = `Usage:
   nbp [-a] [-p] <currency> [date]
+  nbp [-a] [-p] [date] <currency>
   nbp [-a] update
   nbp last
 
-  date     YYYY-MM-DD or YYYYMMDD (default: today)
+  currency three-letter code, e.g. USD
+  date     YYYY-MM-DD or YYYYMMDD (default: today); the reversed
+           DD-MM-YYYY, DD.MM.YYYY, DD/MM/YYYY and DDMMYYYY are detected
+           automatically, and the date may come before the currency
   -a       use table A (the only supported table)
   -p       use the rate from the last business day before date (D-1)
   -h       show this help
@@ -36,6 +39,12 @@ const (
 The update command downloads current data into pkg/data/a and must be run
 from the repository root. Rebuild afterwards to embed the new data.
 The last command prints the date of the newest embedded rate.
+
+Examples:
+  nbp USD
+  nbp usd 2026-11-06
+  nbp 06-11-2026 usd
+  nbp -p EUR 20261106
 `
 )
 
@@ -151,8 +160,17 @@ func runQuery(stdout io.Writer, repo RateProvider, opts cliArgs, now time.Time) 
 		getRate = repo.GetRateBefore
 	}
 	rate, found, err := getRate(opts.cur, target)
-	if errors.Is(err, nbpoffline.ErrDateAfterData) {
+	switch {
+	case errors.Is(err, nbpoffline.ErrDateAfterData):
 		return fmt.Errorf("%w. Run 'nbp update' and rebuild to load newer data", err)
+	case errors.Is(err, nbpoffline.ErrCurrencyNotFound):
+		return fmt.Errorf("%w. Use a three-letter code such as USD or EUR; "+
+			"if it is a new currency, run 'nbp update' and rebuild", err)
+	case errors.Is(err, nbpoffline.ErrRateNotFound):
+		return fmt.Errorf("%w. The date may be older than the embedded data (see 'nbp last'); "+
+			"otherwise run 'nbp update' and rebuild", err)
+	case errors.Is(err, nbpoffline.ErrNoData):
+		return fmt.Errorf("%w. Run 'nbp update' and rebuild", err)
 	}
 	if err != nil {
 		return fmt.Errorf("getting rate: %w", err)
@@ -214,19 +232,55 @@ func parseArgs(args []string) (cliArgs, error) {
 	}
 
 	opts.cmd = cmdQuery
-	opts.cur = positional[0]
-	if len(positional) > 1 {
-		opts.date = positional[1]
+	switch len(positional) {
+	case 1:
+		if _, err := parseDate(positional[0]); err == nil {
+			return cliArgs{}, fmt.Errorf("missing currency: got only the date %q", positional[0])
+		}
+		opts.cur = positional[0]
+	case 2:
+		cur, date := positional[0], positional[1]
+		// The date may be given before the currency.
+		if _, err := parseDate(cur); err == nil {
+			cur, date = date, cur
+		}
+		if _, err := parseDate(date); err != nil {
+			return cliArgs{}, err
+		}
+		opts.cur, opts.date = cur, date
+	}
+	if !isCurrencyCode(opts.cur) {
+		return cliArgs{}, fmt.Errorf("invalid currency %q: want a three-letter code such as USD", opts.cur)
 	}
 	return opts, nil
 }
 
-// parseDate accepts YYYY-MM-DD or YYYYMMDD.
+func isCurrencyCode(s string) bool {
+	if len(s) != 3 {
+		return false
+	}
+	for _, r := range strings.ToUpper(s) {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// dateLayouts lists the accepted date formats. Year-first layouts come first so
+// that an 8-digit string is read as YYYYMMDD whenever that is valid.
+var dateLayouts = []string{
+	"2006-01-02", "20060102", "2006.01.02", "2006/01/02",
+	"02-01-2006", "02.01.2006", "02/01/2006", "02012006",
+}
+
+// parseDate accepts YYYY-MM-DD and YYYYMMDD as well as the day-first forms
+// DD-MM-YYYY, DD.MM.YYYY, DD/MM/YYYY and DDMMYYYY.
 func parseDate(s string) (time.Time, error) {
-	for _, layout := range []string{dateLayout, compactDateLayout} {
+	for _, layout := range dateLayouts {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t, nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("invalid date %q: want YYYY-MM-DD or YYYYMMDD", s)
+	return time.Time{}, fmt.Errorf("invalid date %q: want YYYY-MM-DD, YYYYMMDD or DD-MM-YYYY", s)
 }

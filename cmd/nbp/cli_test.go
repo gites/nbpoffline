@@ -82,6 +82,11 @@ func TestParseArgs(t *testing.T) {
 		{name: "short help", give: []string{"nbp", "-h"}, wantErr: flag.ErrHelp},
 		{name: "long help", give: []string{"nbp", "--help"}, wantErr: flag.ErrHelp},
 		{name: "help after args", give: []string{"nbp", "USD", "-h"}, wantErr: flag.ErrHelp},
+		{name: "date before currency", give: []string{"nbp", "06-11-2026", "usd"}, wantCmd: "query", wantCur: "usd", wantDate: "06-11-2026"},
+		{name: "compact date before currency", give: []string{"nbp", "20261106", "usd"}, wantCmd: "query", wantCur: "usd", wantDate: "20261106"},
+		{name: "only date", give: []string{"nbp", "2026-11-06"}, wantAny: true},
+		{name: "bad currency", give: []string{"nbp", "dollar"}, wantAny: true},
+		{name: "two currencies", give: []string{"nbp", "usd", "eur"}, wantAny: true},
 		{name: "no args", give: []string{"nbp"}, wantAny: true},
 		{name: "only flag", give: []string{"nbp", "-a"}, wantAny: true},
 		{name: "unknown flag", give: []string{"nbp", "-x", "USD"}, wantAny: true},
@@ -122,6 +127,10 @@ func TestParseDate(t *testing.T) {
 	}{
 		{name: "dashed", give: "2024-01-05", want: day(2024, 1, 5)},
 		{name: "compact", give: "20240105", want: day(2024, 1, 5)},
+		{name: "day first dashed", give: "05-01-2024", want: day(2024, 1, 5)},
+		{name: "day first dotted", give: "05.01.2024", want: day(2024, 1, 5)},
+		{name: "day first slashed", give: "05/01/2024", want: day(2024, 1, 5)},
+		{name: "day first compact", give: "05012024", want: day(2024, 1, 5)},
 		{name: "garbage", give: "yesterday", wantErr: true},
 	}
 
@@ -378,5 +387,28 @@ func TestRunQueryDateAfterDataHint(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "nbp update") {
 		t.Errorf("err = %q, want hint about 'nbp update'", err)
+	}
+}
+
+func TestRunQueryErrorHints(t *testing.T) {
+	tests := []struct {
+		name string
+		give error
+		want string
+	}{
+		{name: "rate not found", give: nbpoffline.ErrRateNotFound, want: "nbp last"},
+		{name: "currency not found", give: nbpoffline.ErrCurrencyNotFound, want: "three-letter"},
+		{name: "no data", give: nbpoffline.ErrNoData, want: "nbp update"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := run([]string{"nbp", "USD", "2024-03-12"}, &bytes.Buffer{}, &bytes.Buffer{}, &mockRepo{err: tt.give}, &mockDownloader{}, time.Now)
+			if !errors.Is(err, tt.give) {
+				t.Fatalf("err = %v, want %v", err, tt.give)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("err = %q, want hint containing %q", err, tt.want)
+			}
+		})
 	}
 }
